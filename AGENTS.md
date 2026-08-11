@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This repository contains a small OpenCode style-lint plugin. It rejects configured prose patterns in final assistant output and before supported write tools execute.
+This repository contains a small OpenCode slop-blocking plugin. It rejects configured prose patterns in final assistant output and before supported write tools execute.
 
 ## Constraints
 
