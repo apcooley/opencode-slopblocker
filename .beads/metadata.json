@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "opencode_style_linter",
+  "project_id": "3670a96a-0e0e-4ba1-ae83-d1fd156da6ed"
+}
