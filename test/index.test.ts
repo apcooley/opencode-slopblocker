@@ -162,6 +162,28 @@ describe("output linting", () => {
   })
 })
 
+describe("compaction", () => {
+  test("skips linting while compacting and resumes after idle", async () => {
+    const compacting = await plugin({} as never)
+    const input = { sessionID: "compaction", messageID: "message", partID: "part" }
+
+    await compacting["experimental.session.compacting"]!(
+      { sessionID: "compaction" },
+      { context: [] },
+    )
+    const summary = { text: `Summary ${dash} ${words[0]}.` }
+    await compacting["experimental.text.complete"]!(input, summary)
+    expect(summary.text).toBe(`Summary ${dash} ${words[0]}.`)
+
+    await compacting.event!({
+      event: { type: "session.idle", properties: { sessionID: "compaction" } },
+    })
+    const after = { text: words[0] }
+    await compacting["experimental.text.complete"]!(input, after)
+    expect(after.text).toBe(notice)
+  })
+})
+
 describe("write linting", () => {
   test.each([
     ["write", { content: `A ${words[0]} problem` }],

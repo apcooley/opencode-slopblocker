@@ -152,6 +152,7 @@ function createSlopBlocker(rules: Rule[], banned: string, allowOverride: boolean
   return async ({ client, directory }) => {
     const pending = new Map<string, string>()
     const attempts = new Map<string, number>()
+    const compacting = new Set<string>()
 
     return {
       "chat.message": async (input, output) => {
@@ -161,6 +162,7 @@ function createSlopBlocker(rules: Rule[], banned: string, allowOverride: boolean
         }
       },
       "experimental.text.complete": async (input, output) => {
+        if (compacting.has(input.sessionID)) return
         const attempt = attempts.get(input.sessionID) ?? 0
         const replacement = allowOverride ? stripOverride(output.text) : undefined
         if (replacement !== undefined) {
@@ -188,8 +190,12 @@ function createSlopBlocker(rules: Rule[], banned: string, allowOverride: boolean
         pending.delete(input.sessionID)
         attempts.delete(input.sessionID)
       },
+      "experimental.session.compacting": async (input) => {
+        compacting.add(input.sessionID)
+      },
       event: async ({ event }) => {
         if (event.type !== "session.idle") return
+        compacting.delete(event.properties.sessionID)
         const message = pending.get(event.properties.sessionID)
         if (!message) return
         pending.delete(event.properties.sessionID)

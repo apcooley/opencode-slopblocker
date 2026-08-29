@@ -48,7 +48,7 @@ Set personal rules in the plugin tuple in `opencode.jsonc`:
 
 Set `allowOverride` to `true` to bypass all rules for one response or write. Prefix the affected content with `$SLOPBLOCK_OVERRIDE=TRUE` and a newline. The plugin removes the prefix before returning the response or executing the write. If the remaining content violates a rule, response overrides include a warning and write overrides show a warning toast. Overrides are rejected when the option is disabled, which is the default.
 
-Rejected responses get up to `maxRetries` automatic rewrite attempts (default 3). A clean rewrite or an enabled explicit override is returned; once the budget is exhausted, the plugin stops and shows the user a notice instead of retrying again. Each corrective prompt sent to the agent states every configured rule up front ("YOUR RESPONSE WILL BE REJECTED IF IT CONTAINS ANY OF THE FOLLOWING:") so a retry does not fail on a different rule, and write-tool lint errors include the same list.
+Rejected responses get up to `maxRetries` automatic rewrite attempts (default 3). A clean rewrite or an enabled explicit override is returned; once the budget is exhausted, the plugin stops and shows the user a notice instead of retrying again. Each corrective prompt sent to the agent states every configured rule up front ("YOUR RESPONSE WILL BE REJECTED IF IT CONTAINS ANY OF THE FOLLOWING:") so a retry does not fail on a different rule, and write-tool lint errors include the same list. Session compaction summaries are exempt from response linting.
 
 ## Development
 
