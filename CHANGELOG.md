@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Announce the configured rules in every system prompt, so agents know them before their first response.
+- Add `onExhausted` (`stop` or `slop`, default `stop`): after the retry budget runs out, either halt with a notice or pass the content through with the override warning.
 - Make the automatic retry budget configurable via `maxRetries` (default 3, was a hard-coded 1).
 - State every configured rule in corrective prompts and write-tool lint errors, so agents stop failing one rule at a time.
 - Restore the opt-in, stripped override prefix for individual responses and writes.

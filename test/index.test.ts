@@ -131,6 +131,22 @@ describe("output linting", () => {
     expect(second.text).toBe("[Slop blocker stopped the response after 1 automatic retry.]")
   })
 
+  test("passes the slop response through with a warning when onExhausted is slop", async () => {
+    const blocked = ["flag", "ged"].join("")
+    const retrying = await plugin({} as never, {
+      blockedWords: [blocked],
+      maxRetries: 1,
+      onExhausted: "slop",
+    })
+    const input = { sessionID: "slop-exhausted", messageID: "message", partID: "part" }
+
+    await retrying["experimental.text.complete"]!(input, { text: blocked })
+    const second = { text: blocked }
+    await retrying["experimental.text.complete"]!(input, second)
+
+    expect(second.text).toBe(`${overrideWarning}\n\n${blocked}`)
+  })
+
   test("recovers within the budget after repeated violations", async () => {
     const blocked = ["flag", "ged"].join("")
     const retrying = await plugin({} as never, { blockedWords: [blocked] })
@@ -159,6 +175,26 @@ describe("output linting", () => {
 
     expect(clean.text).toBe("Rewritten response.")
     expect(later.text).toBe(notice)
+  })
+})
+
+describe("system prompt", () => {
+  test("announces em dash and words by default", async () => {
+    const output = { system: [] as string[] }
+    await hooks["experimental.chat.system.transform"]!({} as never, output)
+    expect(output.system).toHaveLength(1)
+    expect(output.system[0]).toContain(`the em dash character (${dash})`)
+    expect(output.system[0]).toContain(`"${words[0]}"`)
+    expect(output.system[0]).toContain("automatic style checker")
+  })
+
+  test("matches configured rules", async () => {
+    const customWord = ["obvi", "ously"].join("")
+    const custom = await plugin({} as never, { blockEmDash: false, blockedWords: [customWord] })
+    const output = { system: [] as string[] }
+    await custom["experimental.chat.system.transform"]!({} as never, output)
+    expect(output.system[0]).toContain(`"${customWord}"`)
+    expect(output.system[0]).not.toContain("em dash")
   })
 })
 
@@ -341,6 +377,7 @@ describe("configuration", () => {
     [{ allowOverride: "yes" }, "allowOverride must be a boolean"],
     [{ maxRetries: -1 }, "maxRetries must be a non-negative integer"],
     [{ maxRetries: 1.5 }, "maxRetries must be a non-negative integer"],
+    [{ onExhausted: "explode" }, 'onExhausted must be "stop" or "slop"'],
   ])("rejects invalid options", async (options, message) => {
     await expect(plugin({} as never, options)).rejects.toThrow(`slop blocker: ${message}`)
   })

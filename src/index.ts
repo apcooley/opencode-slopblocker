@@ -94,6 +94,14 @@ function maxRetriesFromOptions(value: PluginOptions) {
   return maxRetries
 }
 
+function onExhaustedFromOptions(value: PluginOptions): "stop" | "slop" {
+  const onExhausted = value.onExhausted ?? "stop"
+  if (onExhausted !== "stop" && onExhausted !== "slop") {
+    throw new TypeError('slop blocker: onExhausted must be "stop" or "slop"')
+  }
+  return onExhausted
+}
+
 function builtInText(tool: string, value: unknown): TextField[] {
   const paths: Record<string, string[]> = {
     write: ["content"],
@@ -125,7 +133,7 @@ function stripOverride(text: string) {
   if (text.startsWith(`${overrideToken}\n`)) return text.slice(overrideToken.length + 1)
 }
 
-function createSlopBlocker(rules: Rule[], banned: string, allowOverride: boolean, maxRetries: number): Plugin {
+function createSlopBlocker(rules: Rule[], banned: string, allowOverride: boolean, maxRetries: number, onExhausted: "stop" | "slop"): Plugin {
   function violation(text: string) {
     for (const rule of rules) {
       rule.pattern.lastIndex = 0
@@ -155,6 +163,12 @@ function createSlopBlocker(rules: Rule[], banned: string, allowOverride: boolean
     const compacting = new Set<string>()
 
     return {
+      "experimental.chat.system.transform": async (_input, output) => {
+        if (!banned) return
+        output.system.push(
+          `Never use ${banned}. An automatic style checker rejects responses and writes that contain them.`,
+        )
+      },
       "chat.message": async (input, output) => {
         if (output.parts.some((part) => part.type === "text" && !part.synthetic)) {
           pending.delete(input.sessionID)
@@ -184,9 +198,11 @@ function createSlopBlocker(rules: Rule[], banned: string, allowOverride: boolean
           return
         }
 
-        output.text = `[Slop blocker stopped the response after ${maxRetries} automatic ${
-          maxRetries === 1 ? "retry" : "retries"
-        }.${allowOverride ? ` To proceed intentionally, retry with ${overrideToken}.` : ""}]`
+        output.text = onExhausted === "slop"
+          ? `${overrideWarning}\n\n${output.text}`
+          : `[Slop blocker stopped the response after ${maxRetries} automatic ${
+              maxRetries === 1 ? "retry" : "retries"
+            }.${allowOverride ? ` To proceed intentionally, retry with ${overrideToken}.` : ""}]`
         pending.delete(input.sessionID)
         attempts.delete(input.sessionID)
       },
@@ -250,6 +266,7 @@ const plugin: Plugin = async (input, options = {}) => {
     banned,
     allowOverrideFromOptions(options),
     maxRetriesFromOptions(options),
+    onExhaustedFromOptions(options),
   )(input)
 }
 
