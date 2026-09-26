@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test"
-import plugin from "../src/index.ts"
+import { mkdtempSync, readFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import plugin, { createSlopBlocker, type Rule } from "../src/index.ts"
+
+// Hermetic: a RADAR worker session exports RADAR_SLOP_COACH_FILE, which flips
+// the plugin into worker mode and would break these interactive-mode tests.
+delete process.env.RADAR_SLOP_COACH_FILE
 
 const dash = String.fromCodePoint(0x2014)
 const words = [
@@ -9,8 +16,8 @@ const words = [
   ["com", "pounding"].join(""),
   ["sub", "strate"].join(""),
 ]
-const notice = "[Response blocked by slop blocker; retrying.]"
-const retryLimitNotice = "[Slop blocker stopped the response after 3 automatic retries.]"
+const notice = "[Response blocked by slop blocker; retrying. I'm bozo the clown.]"
+const retryLimitNotice = "[Slop blocker stopped the response after 5 automatic retries.]"
 const overrideToken = "$SLOPBLOCK_OVERRIDE=TRUE"
 const overrideWarning = "[Warning: Slop blocker override used; this response violates configured style rules.]"
 
@@ -79,6 +86,78 @@ describe("output linting", () => {
     expect(promptText).toContain(`these words (case-insensitive): "${blocked}"`)
   })
 
+  test("re-arms the coach prompt when delivery fails, then delivers on the next idle", async () => {
+    const prompts: unknown[] = []
+    const blocked = ["flag", "ged"].join("")
+    let failing = true
+    const retrying = await plugin({
+      directory: "/workspace",
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            if (failing) {
+              failing = false
+              throw new Error("session is busy")
+            }
+            prompts.push(input)
+            return {}
+          },
+        },
+      },
+    } as never, { blockedWords: [blocked] })
+
+    const output = { text: `This was ${blocked}.` }
+    await retrying["experimental.text.complete"]!(
+      { sessionID: "rearm", messageID: "message", partID: "part" },
+      output,
+    )
+    await retrying.event!({
+      event: { type: "session.idle", properties: { sessionID: "rearm" } },
+    })
+    expect(prompts).toHaveLength(0)
+
+    await retrying.event!({
+      event: { type: "session.idle", properties: { sessionID: "rearm" } },
+    })
+    expect(prompts).toHaveLength(1)
+    const promptText = (prompts[0] as { body: { parts: [{ text: string }] } }).body.parts[0].text
+    expect(promptText).toContain(`word "${blocked}"`)
+  })
+
+  test("delivers the queued coach once when idle repeats while a post is in flight", async () => {
+    const prompts: unknown[] = []
+    const blocked = ["flag", "ged"].join("")
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const retrying = await plugin({
+      directory: "/workspace",
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            prompts.push(input)
+            await gate
+            return {}
+          },
+        },
+      },
+    } as never, { blockedWords: [blocked] })
+
+    const output = { text: `This was ${blocked}.` }
+    await retrying["experimental.text.complete"]!(
+      { sessionID: "inflight", messageID: "message", partID: "part" },
+      output,
+    )
+    const first = retrying.event!({
+      event: { type: "session.idle", properties: { sessionID: "inflight" } },
+    })
+    await retrying.event!({
+      event: { type: "session.idle", properties: { sessionID: "inflight" } },
+    })
+    release()
+    await first
+    expect(prompts).toHaveLength(1)
+  })
+
   test("offers an intentional override in the corrective prompt when enabled", async () => {
     const prompts: unknown[] = []
     const blocked = ["flag", "ged"].join("")
@@ -101,22 +180,22 @@ describe("output linting", () => {
     }))
   })
 
-  test("stops after three automatic retries by default", async () => {
+  test("stops after five automatic retries by default", async () => {
     const blocked = ["flag", "ged"].join("")
     const retrying = await plugin({} as never, { blockedWords: [blocked] })
     const input = { sessionID: "limited", messageID: "message", partID: "part" }
 
-    await retrying["experimental.text.complete"]!(input, { text: blocked })
-    const second = { text: blocked }
-    await retrying["experimental.text.complete"]!(input, second)
-    const third = { text: blocked }
-    await retrying["experimental.text.complete"]!(input, third)
-    const fourth = { text: blocked }
-    await retrying["experimental.text.complete"]!(input, fourth)
+    const retries: Array<{ text: string }> = []
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const output = { text: blocked }
+      await retrying["experimental.text.complete"]!(input, output)
+      retries.push(output)
+    }
+    const final = { text: blocked }
+    await retrying["experimental.text.complete"]!(input, final)
 
-    expect(second.text).toBe(notice)
-    expect(third.text).toBe(notice)
-    expect(fourth.text).toBe(retryLimitNotice)
+    for (const output of retries) expect(output.text).toBe(notice)
+    expect(final.text).toBe(retryLimitNotice)
   })
 
   test("honors a configured retry budget", async () => {
@@ -175,6 +254,98 @@ describe("output linting", () => {
 
     expect(clean.text).toBe("Rewritten response.")
     expect(later.text).toBe(notice)
+  })
+})
+
+describe("interactive host", () => {
+  // A bun Worker cannot emulate the TUI host here: bun 1.3.14 workers inherit
+  // the parent environment and ignore both in-worker env writes and the Worker
+  // env option, so RADAR_SLOP_COACH_FILE would leak in. The isMainThread gate
+  // itself is verified by probe (worker: false, main: true).
+  const rule: Rule = {
+    pattern: /xblockedwordx/iu,
+    message: "Rephrase the sentence(s) containing the word \"xblockedwordx\" to sound more human",
+  }
+  const hooks = async (blankInteractive: boolean) =>
+    await createSlopBlocker([rule], "", false, 5, "stop", undefined, blankInteractive)({} as never)
+  const input = { sessionID: "tui", messageID: "message", partID: "part" }
+
+  test("blanks a blocked response pre-render when interactive", async () => {
+    const output = { text: "xblockedwordx" }
+    await (await hooks(true))["experimental.text.complete"]!(input, output)
+    expect(output.text).toBe("")
+  })
+
+  test("keeps the retry marker when not interactive", async () => {
+    const output = { text: "xblockedwordx" }
+    await (await hooks(false))["experimental.text.complete"]!(input, output)
+    expect(output.text).toBe(notice)
+  })
+
+  test("still queues the coach prompt on idle when blanking", async () => {
+    const prompts: unknown[] = []
+    const blanking = await createSlopBlocker([rule], "", false, 5, "stop", undefined, true)({
+      directory: "/workspace",
+      client: {
+        session: {
+          promptAsync: async (prompt: unknown) => {
+            prompts.push(prompt)
+            return {}
+          },
+        },
+      },
+    } as never)
+    const output = { text: "xblockedwordx" }
+    await blanking["experimental.text.complete"]!(input, output)
+    await blanking.event!({
+      event: { type: "session.idle", properties: { sessionID: "tui" } },
+    })
+    expect(output.text).toBe("")
+    expect(prompts).toHaveLength(1)
+    const prompt = prompts[0] as { body: { parts: [{ text: string }] } }
+    expect(prompt.body.parts[0].text).toContain("style checker")
+  })
+
+  test("blanks within the cap, then surfaces the final failure", async () => {
+    const blanking = await hooks(true)
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const output = { text: "xblockedwordx" }
+      await blanking["experimental.text.complete"]!(input, output)
+      expect(output.text).toBe("")
+    }
+    const exhausted = { text: "xblockedwordx" }
+    await blanking["experimental.text.complete"]!(input, exhausted)
+    expect(exhausted.text).toContain("stopped")
+    expect(exhausted.text).toContain("5 automatic retries")
+  })
+})
+
+describe("worker mode", () => {
+  test("keeps the retry marker and writes a coach record when a coach file is set", async () => {
+    const coachFile = join(mkdtempSync(join(tmpdir(), "slopblocker-")), "coach.json")
+    process.env.RADAR_SLOP_COACH_FILE = coachFile
+    const prompts: unknown[] = []
+    try {
+      const worker = await plugin({
+        directory: "/workspace",
+        client: { session: { promptAsync: async (input: unknown) => { prompts.push(input) } } },
+      } as never, { blockedWords: ["xblockedwordx"] })
+
+      const output = { text: "xblockedwordx" }
+      await worker["experimental.text.complete"]!(
+        { sessionID: "coached", messageID: "message", partID: "part" },
+        output,
+      )
+
+      expect(output.text).toBe(notice)
+      expect(prompts).toHaveLength(0)
+      const record = JSON.parse(readFileSync(coachFile, "utf8")) as Record<string, unknown>
+      expect(record.sessionID).toBe("coached")
+      expect(record.attempt).toBe(1)
+      expect(typeof record.message).toBe("string")
+    } finally {
+      delete process.env.RADAR_SLOP_COACH_FILE
+    }
   })
 })
 
@@ -316,7 +487,7 @@ describe("override", () => {
     const input = { sessionID: "rejected-retry", messageID: "message", partID: "part" }
 
     await overridden["experimental.text.complete"]!(input, { text: words[0] })
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
       await overridden["experimental.text.complete"]!(input, { text: words[0] })
     }
     const final = { text: words[0] }

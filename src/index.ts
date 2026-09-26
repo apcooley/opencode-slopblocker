@@ -1,3 +1,5 @@
+import { appendFileSync, writeFileSync } from "node:fs"
+import { isMainThread } from "node:worker_threads"
 import type { Plugin, PluginOptions } from "@opencode-ai/plugin"
 
 type TextField = {
@@ -7,6 +9,7 @@ type TextField = {
 
 const overrideToken = "$SLOPBLOCK_OVERRIDE=TRUE"
 const overrideWarning = "[Warning: Slop blocker override used; this response violates configured style rules.]"
+const blockedMarker = "[Response blocked by slop blocker; retrying. I'm bozo the clown.]"
 
 export type Rule = {
   pattern: RegExp
@@ -17,6 +20,19 @@ const defaultBlockedWords = ["structural", "compound", "compounds", "compounding
 
 function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" ? value as Record<string, unknown> : {}
+}
+
+// Env-gated debug tracing for diagnosing which delivery path runs per blocked
+// response. Off unless SLOPBLOCK_DEBUG_FILE points at a writable file; a failed
+// debug write must never break the chat.
+function debugLog(line: string) {
+  const path = process.env.SLOPBLOCK_DEBUG_FILE?.trim()
+  if (!path) return
+  try {
+    appendFileSync(path, `${new Date().toISOString()} ${line}\n`)
+  } catch {
+    // ignore: diagnostics only
+  }
 }
 
 function fieldsAtPath(value: unknown, path: string): TextField[] {
@@ -87,7 +103,7 @@ function allowOverrideFromOptions(value: PluginOptions) {
 }
 
 function maxRetriesFromOptions(value: PluginOptions) {
-  const maxRetries = value.maxRetries ?? 3
+  const maxRetries = value.maxRetries ?? 5
   if (typeof maxRetries !== "number" || !Number.isInteger(maxRetries) || maxRetries < 0) {
     throw new TypeError("slop blocker: maxRetries must be a non-negative integer")
   }
@@ -100,6 +116,32 @@ function onExhaustedFromOptions(value: PluginOptions): "stop" | "slop" {
     throw new TypeError('slop blocker: onExhausted must be "stop" or "slop"')
   }
   return onExhausted
+}
+
+// In worker-driven (headless) mode the RADAR worker sets RADAR_SLOP_COACH_FILE:
+// instead of re-prompting the session from the session.idle event, the blocker
+// writes the coaching message to that file and lets the worker deliver it. The
+// headless CLI exits on the first idle status, which the server publishes
+// before the session.idle event, so an async in-plugin retry can never reach a
+// headless run.
+function coachFileFromEnv(): string | undefined {
+  const path = process.env.RADAR_SLOP_COACH_FILE?.trim()
+  return path ? path : undefined
+}
+
+type CoachRecord = {
+  sessionID: string
+  attempt: number
+  message: string
+}
+
+function writeCoachRecord(path: string, record: CoachRecord) {
+  try {
+    writeFileSync(path, JSON.stringify(record))
+  } catch {
+    // The worker falls back to a generic coaching prompt when the file is
+    // missing or stale; a failed write must never break the chat.
+  }
 }
 
 function builtInText(tool: string, value: unknown): TextField[] {
@@ -133,7 +175,17 @@ function stripOverride(text: string) {
   if (text.startsWith(`${overrideToken}\n`)) return text.slice(overrideToken.length + 1)
 }
 
-function createSlopBlocker(rules: Rule[], banned: string, allowOverride: boolean, maxRetries: number, onExhausted: "stop" | "slop"): Plugin {
+// Exported for tests: the last parameter blanks blocked responses pre-render
+// in the interactive TUI (see the default plugin below for the gate).
+export function createSlopBlocker(rules: Rule[], banned: string, allowOverride: boolean, maxRetries: number, onExhausted: "stop" | "slop", coachFile: string | undefined, blankInteractive: boolean): Plugin {
+  function coachText(message: string): string {
+    return `The previous response was rejected by the style checker: ${message}.${banned
+      ? ` YOUR RESPONSE WILL BE REJECTED IF IT CONTAINS ANY OF THE FOLLOWING: ${banned}.`
+      : ""} Rewrite it and answer the user's original request. Do not mention this correction.${allowOverride
+      ? ` If the request cannot be answered correctly without the rejected content, prefix the response with "${overrideToken}" and a newline to override deliberately. Otherwise, do not use the override.`
+      : ""}`
+  }
+
   function violation(text: string) {
     for (const rule of rules) {
       rule.pattern.lastIndex = 0
@@ -161,12 +213,16 @@ function createSlopBlocker(rules: Rule[], banned: string, allowOverride: boolean
     const pending = new Map<string, string>()
     const attempts = new Map<string, number>()
     const compacting = new Set<string>()
+    // Coach deliveries currently in flight, per session. The host invokes the
+    // event hook fire-and-forget, and idle events can repeat while a POST is
+    // still resolving, so the guard prevents a double coach prompt.
+    const delivering = new Set<string>()
 
     return {
       "experimental.chat.system.transform": async (_input, output) => {
         if (!banned) return
         output.system.push(
-          `Never use ${banned}. An automatic style checker rejects responses and writes that contain them.`,
+          `Never use ${banned}. An automatic style checker rejects responses and writes that contain them. I'm bozo the clown.`,
         )
       },
       "chat.message": async (input, output) => {
@@ -192,12 +248,36 @@ function createSlopBlocker(rules: Rule[], banned: string, allowOverride: boolean
         }
 
         if (attempt < maxRetries) {
-          output.text = "[Response blocked by slop blocker; retrying.]"
+          try {
+            // Interactive TUI: blank the violating response pre-render so it is
+            // never shown, then let the queued coach prompt retry on idle.
+            // Every other surface keeps the marker: the RADAR worker greps for
+            // it, and headless runs cannot land an async retry.
+            output.text = blankInteractive ? "" : blockedMarker
+          } catch {
+            // If the blanking path misbehaves, fall back to today's surface.
+            output.text = blockedMarker
+          }
           attempts.set(input.sessionID, attempt + 1)
-          pending.set(input.sessionID, message)
+          debugLog(
+            `block session=${input.sessionID} attempt=${attempt + 1}/${maxRetries} ` +
+              `branch=${coachFile ? "coach-file" : "pending-async"} blankInteractive=${blankInteractive}`,
+          )
+          if (coachFile) {
+            writeCoachRecord(coachFile, {
+              sessionID: input.sessionID,
+              attempt: attempt + 1,
+              message: coachText(message),
+            })
+          } else {
+            pending.set(input.sessionID, message)
+          }
           return
         }
 
+        debugLog(
+          `exhaust session=${input.sessionID} attempt=${attempt}/${maxRetries} onExhausted=${onExhausted}`,
+        )
         output.text = onExhausted === "slop"
           ? `${overrideWarning}\n\n${output.text}`
           : `[Slop blocker stopped the response after ${maxRetries} automatic ${
@@ -211,27 +291,43 @@ function createSlopBlocker(rules: Rule[], banned: string, allowOverride: boolean
       },
       event: async ({ event }) => {
         if (event.type !== "session.idle") return
-        compacting.delete(event.properties.sessionID)
-        const message = pending.get(event.properties.sessionID)
+        const sessionID = event.properties.sessionID
+        debugLog(
+          `idle-enter session=${sessionID} ` +
+            `coachFile=${coachFile ? "set" : "unset"} pendingHas=${pending.has(sessionID)}`,
+        )
+        compacting.delete(sessionID)
+        if (coachFile) {
+          pending.delete(sessionID)
+          return
+        }
+        const message = pending.get(sessionID)
         if (!message) return
-        pending.delete(event.properties.sessionID)
-
-        await client.session.promptAsync({
-          path: { id: event.properties.sessionID },
-          query: { directory },
-          body: {
-            parts: [{
-              type: "text",
-              synthetic: true,
-              text: `The previous response was rejected by the style checker: ${message}.${banned
-                ? ` YOUR RESPONSE WILL BE REJECTED IF IT CONTAINS ANY OF THE FOLLOWING: ${banned}.`
-                : ""} Rewrite it and answer the user's original request. Do not mention this correction.${allowOverride
-                ? ` If the request cannot be answered correctly without the rejected content, prefix the response with "${overrideToken}" and a newline to override deliberately. Otherwise, do not use the override.`
-                : ""}`,
-            }],
-          },
-          throwOnError: true,
-        })
+        if (delivering.has(sessionID)) return
+        delivering.add(sessionID)
+        try {
+          await client.session.promptAsync({
+            path: { id: sessionID },
+            query: { directory },
+            body: {
+              parts: [{
+                type: "text",
+                synthetic: true,
+                text: coachText(message),
+              }],
+            },
+            throwOnError: true,
+          })
+          debugLog(`coach-post-ok session=${sessionID}`)
+          // Pop only after an accepted POST: a failed delivery stays queued
+          // and the next idle retries it instead of stranding the session
+          // mid-retry-budget with no further coach.
+          pending.delete(sessionID)
+        } catch (error) {
+          debugLog(`coach-post-error session=${sessionID} ${String(error)}`)
+        } finally {
+          delivering.delete(sessionID)
+        }
       },
       "tool.execute.before": async (input, output) => {
         const fields = builtInText(input.tool, output.args)
@@ -261,12 +357,26 @@ function createSlopBlocker(rules: Rule[], banned: string, allowOverride: boolean
 
 const plugin: Plugin = async (input, options = {}) => {
   const { rules, banned } = rulesFromOptions(options)
+  const coachFile = coachFileFromEnv()
+  // The interactive TUI hosts the opencode server in a worker thread, while
+  // headless surfaces (run, serve) stay on the main thread. Blank pre-render
+  // only where the async coach retry can land and nothing greps the marker.
+  // ponytail: if opencode ever moves the TUI off a worker thread, this silently
+  // keeps today's marker; the upgrade path is a server-side TUI signal.
+  const blankInteractive = !coachFile && isMainThread === false
+  debugLog(
+    `init coachFile=${coachFile ? "set" : "unset"} blankInteractive=${blankInteractive} ` +
+      `isMainThread=${isMainThread} maxRetries=${maxRetriesFromOptions(options)} ` +
+      `onExhausted=${onExhaustedFromOptions(options)}`,
+  )
   return createSlopBlocker(
     rules,
     banned,
     allowOverrideFromOptions(options),
     maxRetriesFromOptions(options),
     onExhaustedFromOptions(options),
+    coachFile,
+    blankInteractive,
   )(input)
 }
 
