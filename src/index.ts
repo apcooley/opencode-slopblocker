@@ -62,7 +62,9 @@ function fieldsAtPath(value: unknown, path: string): TextField[] {
   return visit(value, path.split("."))
 }
 
-function rulesFromOptions(value: PluginOptions): { rules: Rule[]; banned: string } {
+// Exported for tests: the test harness pins the host explicitly (bun workers
+// cannot emulate the TUI host), which needs the default rule set.
+export function rulesFromOptions(value: PluginOptions): { rules: Rule[]; banned: string } {
   const blockEmDash = value.blockEmDash ?? true
   const blockedWords = value.blockedWords ?? defaultBlockedWords
 
@@ -175,9 +177,27 @@ function stripOverride(text: string) {
   if (text.startsWith(`${overrideToken}\n`)) return text.slice(overrideToken.length + 1)
 }
 
-// Exported for tests: the last parameter blanks blocked responses pre-render
-// in the interactive TUI (see the default plugin below for the gate).
-export function createSlopBlocker(rules: Rule[], banned: string, allowOverride: boolean, maxRetries: number, onExhausted: "stop" | "slop", coachFile: string | undefined, blankInteractive: boolean): Plugin {
+// External publish surfaces keep their lints in every host, including
+// headless workers: posts to people, writes to shared work surfaces, and
+// comments on shared delivery context are CO-facing or externally visible.
+// Headless runs skip lints for every other tool (internal notes,
+// agent-to-agent calls, and log summaries carry none of this).
+// Ambiguity rule: when a tool name is unclear, match toward linting, because
+// this is the keep-everywhere set.
+function isExternalPublishTool(tool: string): boolean {
+  return (
+    /^slack_slack_(?:post_message|reply_to_thread)$/.test(tool) ||
+    /^notion_notion[-_](?:create|update)/.test(tool) ||
+    /^linear_(?:create|update)_/.test(tool) ||
+    /^linear_(?:create_)?comment/.test(tool)
+  )
+}
+
+// Exported for tests: the second-to-last parameter blanks blocked responses
+// pre-render in the interactive TUI, and the last parameter scopes the
+// blocker to CO-facing surfaces when the host is headless (see the default
+// plugin below for both gates).
+export function createSlopBlocker(rules: Rule[], banned: string, allowOverride: boolean, maxRetries: number, onExhausted: "stop" | "slop", coachFile: string | undefined, blankInteractive: boolean, headless = false): Plugin {
   function coachText(message: string): string {
     return `The previous response was rejected by the style checker: ${message}.${banned
       ? ` YOUR RESPONSE WILL BE REJECTED IF IT CONTAINS ANY OF THE FOLLOWING: ${banned}.`
@@ -220,6 +240,9 @@ export function createSlopBlocker(rules: Rule[], banned: string, allowOverride: 
 
     return {
       "experimental.chat.system.transform": async (_input, output) => {
+        // Headless workers host no CO conversation, so their prompts need no
+        // persona announcement.
+        if (headless) return
         if (!banned) return
         output.system.push(
           `Never use ${banned}. An automatic style checker rejects responses and writes that contain them. I'm bozo the clown.`,
@@ -232,6 +255,13 @@ export function createSlopBlocker(rules: Rule[], banned: string, allowOverride: 
         }
       },
       "experimental.text.complete": async (input, output) => {
+        // Headless responses land in logs (log summaries, agent-to-agent
+        // notes), which the blocker does not style-check; blocking here is
+        // what killed worker runs on false positives. Skipping is strand-free:
+        // pending and attempts are only ever populated on this path, so they
+        // stay empty, and the idle handler's coachFile early-exit plus the
+        // empty pending map leave the delivery path consistent.
+        if (headless) return
         if (compacting.has(input.sessionID)) return
         const attempt = attempts.get(input.sessionID) ?? 0
         const replacement = allowOverride ? stripOverride(output.text) : undefined
@@ -330,6 +360,9 @@ export function createSlopBlocker(rules: Rule[], banned: string, allowOverride: 
         }
       },
       "tool.execute.before": async (input, output) => {
+        // In headless, only external publish tools are style-checked; the
+        // TUI keeps today's every-tool linting.
+        if (headless && !isExternalPublishTool(input.tool)) return
         const fields = builtInText(input.tool, output.args)
         if (allowOverride) {
           for (const field of fields) {
@@ -358,6 +391,12 @@ export function createSlopBlocker(rules: Rule[], banned: string, allowOverride: 
 const plugin: Plugin = async (input, options = {}) => {
   const { rules, banned } = rulesFromOptions(options)
   const coachFile = coachFileFromEnv()
+  // Headless signal: RADAR worker sessions set the coach file, and non-TUI
+  // surfaces (run, serve) host the plugin on the main thread, while the
+  // interactive TUI hosts it in a worker thread (obl-brgj init-line
+  // evidence). The interactive TUI is the complement: no coach file and a
+  // worker-thread host.
+  const headless = coachFile !== undefined || isMainThread === true
   // The interactive TUI hosts the opencode server in a worker thread, while
   // headless surfaces (run, serve) stay on the main thread. Blank pre-render
   // only where the async coach retry can land and nothing greps the marker.
@@ -365,8 +404,9 @@ const plugin: Plugin = async (input, options = {}) => {
   // keeps today's marker; the upgrade path is a server-side TUI signal.
   const blankInteractive = !coachFile && isMainThread === false
   debugLog(
-    `init coachFile=${coachFile ? "set" : "unset"} blankInteractive=${blankInteractive} ` +
-      `isMainThread=${isMainThread} maxRetries=${maxRetriesFromOptions(options)} ` +
+    `init coachFile=${coachFile ? "set" : "unset"} headless=${headless} ` +
+      `blankInteractive=${blankInteractive} isMainThread=${isMainThread} ` +
+      `maxRetries=${maxRetriesFromOptions(options)} ` +
       `onExhausted=${onExhaustedFromOptions(options)}`,
   )
   return createSlopBlocker(
@@ -377,6 +417,7 @@ const plugin: Plugin = async (input, options = {}) => {
     onExhaustedFromOptions(options),
     coachFile,
     blankInteractive,
+    headless,
   )(input)
 }
 
